@@ -1,0 +1,30 @@
+name: fastapi-crud-ha
+
+services:
+  pg-primary:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: user123
+      POSTGRES_PASSWORD: app_pwd123
+      POSTGRES_DB: appdb
+    ports: ["5432:5432"]
+    volumes:
+      - ./postgres/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - pg_primary_data:/var/lib/postgresql/data
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user123 -d appdb -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  api:
+    build: ./api
+    ports: ["8000:8000"]
+    environment:
+      PG_PRIMARY_DSN: postgresql://user123:app_pwd123@pg-primary:5432/appdb
+    depends_on:
+      pg-primary: { condition: service_healthy }
+
+volumes:
+  pg_primary_data:
