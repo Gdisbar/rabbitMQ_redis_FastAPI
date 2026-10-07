@@ -4,9 +4,19 @@
 **Start the Instance**
 
 ```bash
+# delete volume & any broken pg_primary data
+docker compose down -v
+# start instance
 docker compose up --build -d 
-# test using
-curl localhost:8000/health
+# check logs - in pgadmin4 
+docker compose logs -f pg-primary
+# test on docker (pg-primary: The specific service/container name defined in your docker-compose.yml)
+docker compose exec pg-primary psql -U app -d appdb -c "SELECT id, username FROM users;"
+# testing on postman
+localhost:8000/health
+
+
+
 ```
 
 ```bash

@@ -5,7 +5,7 @@ from ..schemas import ItemCreate, ItemUpdate
 
 router = APIRouter(tags=["items"])
 
-# NOTE: no auth yet. owner_id is hard-coded to 1 (alice) for demo purposes.
+# no auth yet. owner_id is hard-coded to 1 (alice) for demo purposes.
 OWNER_ID = 1
 
 
