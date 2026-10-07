@@ -45,6 +45,10 @@ docker compose up -d --build api
 # get registered users (seed.sql)
 docker compose exec pg-primary psql -U user123 -d appdb -c "SELECT id, username, left(password_hash,7) AS hash_prefix FROM users;"
 
+# First use the Bearer token & get the JWT token per user (alice,bob) 
+# - then login using JWT , when loged in for a particular user
+# you have view access to other user but can't PATCH,DELETE entry
+# created by other user
 ```
 
 
