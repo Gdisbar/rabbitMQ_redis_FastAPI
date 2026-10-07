@@ -11,20 +11,32 @@ services:
     volumes:
       - ./postgres/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
       - pg_primary_data:/var/lib/postgresql/data
-    
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user123 -d appdb -h 127.0.0.1"]
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb -h 127.0.0.1"]
       interval: 5s
       timeout: 5s
       retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   api:
     build: ./api
     ports: ["8000:8000"]
     environment:
       PG_PRIMARY_DSN: postgresql://user123:app_pwd123@pg-primary:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: "K2yBfQFgPnFvCBecUHHqb4h8geNPs3aqsvs4N1A9ouA"
+      JWT_TTL_SECONDS: "3600"
     depends_on:
       pg-primary: { condition: service_healthy }
+      redis:      { condition: service_healthy }
 
 volumes:
   pg_primary_data:
