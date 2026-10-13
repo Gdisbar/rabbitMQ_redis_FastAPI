@@ -3,11 +3,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ..db import pools
 from ..deps import AuthContext, auth_and_rate_limit, require_auth
 from ..schemas import ItemCreate, ItemUpdate
-from ..deps import auth_and_rate_limit
 
-# inject auth-rate-limiting dependency
-router = APIRouter(tags=["items"], dependencies=[Depends(auth_and_rate_limit)])
-
+# inject auth-rate-limiting dependency or you can remove it since Depends is already used
+# router = APIRouter(tags=["items"], dependencies=[Depends(auth_and_rate_limit)])
+router = APIRouter(tags=["items"])
 
 @router.get("/items")
 async def list_items(

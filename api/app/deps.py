@@ -1,13 +1,16 @@
+import time
 from dataclasses import dataclass
 
 import jwt as pyjwt
-from fastapi import Depends,Header, HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from .redis_client import get_redis
+
+from .config import settings
+from .redis_client import rl_script
 from .security import decode_token
 
-# add authorization
 bearer_scheme = HTTPBearer(auto_error=False)
+
 
 @dataclass
 class AuthContext:
@@ -17,11 +20,12 @@ class AuthContext:
     jti: str | None
     exp: int | None
     client_ip: str
+    rate_limit_remaining: int   # NEW — informational; handy for headers later
 
 
 async def auth_and_rate_limit(
     request: Request,
-     creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> AuthContext:
     client_ip = request.client.host if request.client else "unknown"
 
@@ -38,15 +42,42 @@ async def auth_and_rate_limit(
             exp = int(claims.get("exp", 0))
             is_auth = True
         except pyjwt.PyJWTError:
-            # Invalid / expired token → treated as guest.
-            # Sprint 3 will rate-limit this fallback path aggressively.
+            # Bad/expired token → fall back to guest bucket (strict).
             is_auth = False
 
-    # Revocation check — the whole point of using Redis with JWT.
-    if is_auth and jti:
-        if await get_redis().exists(f"jwt:blocklist:{jti}"):
-            raise HTTPException(status_code=401, detail="token revoked")
+    if is_auth:
+        rl_key = f"rl:user:{user_id}"
+        limit = settings.rl_auth_limit
+        window = settings.rl_auth_window_ms
+        blocklist_key = f"jwt:blocklist:{jti}"
+        has_jti = 1
+    else:
+        rl_key = f"rl:ip:{client_ip}"
+        limit = settings.rl_unauth_limit
+        window = settings.rl_unauth_window_ms
+        blocklist_key = "jwt:blocklist:__n/a__"
+        has_jti = 0
 
+    now_ms = int(time.time() * 1000)
+    allowed, count, reason = await rl_script()(
+        keys=[rl_key, "rl:burst:global", blocklist_key],
+        args=[
+            now_ms, window, limit,
+            settings.rl_burst_limit, settings.rl_burst_window_ms,
+            has_jti,
+        ],
+    )
+
+    if not allowed:
+        if reason == "blocked":
+            raise HTTPException(status_code=401, detail="token revoked")
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate limit exceeded ({reason})",
+            headers={"Retry-After": "60"},
+        )
+
+    remaining = max(0, limit - int(count))
     return AuthContext(
         is_authenticated=is_auth,
         user_id=user_id,
@@ -54,6 +85,7 @@ async def auth_and_rate_limit(
         jti=jti,
         exp=exp,
         client_ip=client_ip,
+        rate_limit_remaining=remaining,
     )
 
 

@@ -12,7 +12,7 @@ services:
       - ./postgres/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
       - pg_primary_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d appdb -h 127.0.0.1"]
+      test: ["CMD-SHELL", "pg_isready -U user123 -d appdb -h 127.0.0.1"]
       interval: 5s
       timeout: 5s
       retries: 30
