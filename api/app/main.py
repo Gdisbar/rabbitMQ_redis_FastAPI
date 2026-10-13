@@ -1,3 +1,11 @@
+from .telemetry import setup_telemetry
+# Import the instrumentor
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+# add telemetry @ start
+setup_telemetry() 
+
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,6 +18,7 @@ from .routers import auth, items, me
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    
     await pools.init(settings.pg_primary_dsn)
     await init_redis()
     yield
@@ -18,6 +27,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="FastAPI CRUD + Auth (HA)", lifespan=lifespan)
+
+# Explicitly instrument the app
+FastAPIInstrumentor.instrument_app(app)
+
 app.include_router(auth.router)
 app.include_router(items.router)
 app.include_router(me.router)

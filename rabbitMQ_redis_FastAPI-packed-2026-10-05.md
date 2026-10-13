@@ -1,17 +1,18 @@
 # 📁 Project: rabbitMQ_redis_FastAPI
 
 **📊 Project Overview (Selected Files):**
-- Total Files: 12
-- Total Size: 7.32 KB
-- Total Lines: 255
-- Estimated Tokens: ~1,878 (approx. for LLMs)
+- Total Files: 18
+- Total Size: 20.97 KB
+- Total Lines: 697
+- Estimated Tokens: ~5,314 (approx. for LLMs)
 
 **📋 Top File Types:**
-- .py: 8
+- .py: 13
 - (no ext): 1
 - .txt: 1
 - .yml: 1
 - .sql: 1
+- .md: 1
 
 🔖 Legend: ✓=included · ✗=excluded · 📂=folder
 
@@ -23,18 +24,24 @@ rabbitMQ_redis_FastAPI/
 │   ├── 📂 app/
 │   │   ├── 📂 routers/
 │   │   │   ├── __init__.py ✓
-│   │   │   └── items.py ✓
+│   │   │   ├── auth.py ✓
+│   │   │   ├── items.py ✓
+│   │   │   └── me.py ✓
 │   │   ├── __init__.py ✓
 │   │   ├── config.py ✓
 │   │   ├── db.py ✓
+│   │   ├── deps.py ✓
 │   │   ├── main.py ✓
-│   │   └── schemas.py ✓
+│   │   ├── redis_client.py ✓
+│   │   ├── schemas.py ✓
+│   │   └── security.py ✓
 │   ├── __init__.py ✓
 │   ├── Dockerfile ✓
 │   └── requirements.txt ✓
 ├── 📂 postgres/
 │   └── seed.sql ✓
-└── docker-compose.yml ✓
+├── docker-compose.yml ✓
+└── README.md ✓
 ```
 
 ## 📄 Files Content
@@ -61,25 +68,65 @@ Size: 0 B | Lines: 1
 
 ================================================================================
 📄 **api\app\config.py**
-Size: 440 B | Lines: 18
+Size: 1.91 KB | Lines: 58
 ================================================================================
 
 ```python
-from pydantic_settings import BaseSettings
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    pg_primary_dsn: str = "postgresql://app:app_pass@pg-primary:5432/appdb"
+    # ---- Database ----
+    # No default → app will fail fast if not provided in production.
+    pg_primary_dsn: SecretStr = Field(..., description="Postgres DSN")
 
+    # ---- Redis ----
     redis_url: str = "redis://redis:6379/0"
 
-    jwt_secret: str = "K2yBfQFgPnFvCBecUHHqb4h8geNPs3aqsvs4N1A9ouA"
+    # ---- JWT ----
+    jwt_secret: SecretStr = Field(..., min_length=32)
     jwt_alg: str = "HS256"
-    jwt_ttl_seconds: int = 3600
+    jwt_ttl_seconds: int = Field(3600, ge=60, le=86_400)
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    # ---- Rate limits ----
+    rl_unauth_limit: int = 1
+    rl_unauth_window_ms: int = 60_000
+    rl_auth_limit: int = 15
+    rl_auth_window_ms: int = 60_000
+    rl_burst_limit: int = 800
+    rl_burst_window_ms: int = 1_000
+
+    # ---- Application Insights ----
+    applicationinsights_connection_string: SecretStr | None = None
+    applicationinsights_enabled: bool = False
+
+    # ---- Environment ----
+    environment: str = Field("dev", pattern="^(dev|staging|prod)$")
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",          # ignore unrelated env vars
+    )
+
+    # ---- Validators ----
+    @field_validator("jwt_secret")
+    @classmethod
+    def _jwt_secret_strength(cls, v: SecretStr) -> SecretStr:
+        raw = v.get_secret_value()
+        # Reject obviously weak secrets
+        if raw.lower() in {"secret", "changeme", "password", "test"}:
+            raise ValueError("jwt_secret is too weak")
+        return v
+
+    @field_validator("applicationinsights_connection_string")
+    @classmethod
+    def _ai_required_if_enabled(cls, v, info):
+        # If AI is enabled, the connection string must be present.
+        # (Runs after `enabled` in field order — see model_validator below if you reorder.)
+        return v
 
 
 settings = Settings()
@@ -87,19 +134,19 @@ settings = Settings()
 
 ================================================================================
 📄 **api\app\db.py**
-Size: 398 B | Lines: 16
+Size: 457 B | Lines: 16
 ================================================================================
 
 ```python
 import asyncpg
-
+from .config import settings
 
 class DBPools:
     def __init__(self) -> None:
         self.primary: asyncpg.Pool | None = None
 
     async def init(self, primary_dsn: str) -> None:
-        self.primary = await asyncpg.create_pool(primary_dsn, min_size=1, max_size=8)
+        self.primary = await asyncpg.create_pool(settings.pg_primary_dsn.get_secret_value(), min_size=1, max_size=8)
 
     async def close(self) -> None:
         if self.primary is not None:
@@ -110,8 +157,79 @@ pools = DBPools()
 ```
 
 ================================================================================
+📄 **api\app\deps.py**
+Size: 1.89 KB | Lines: 63
+================================================================================
+
+```python
+from dataclasses import dataclass
+
+import jwt as pyjwt
+from fastapi import Depends,Header, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from .redis_client import get_redis
+from .security import decode_token
+
+# add authorization
+bearer_scheme = HTTPBearer(auto_error=False)
+
+@dataclass
+class AuthContext:
+    is_authenticated: bool
+    user_id: int | None
+    username: str | None
+    jti: str | None
+    exp: int | None
+    client_ip: str
+
+
+async def auth_and_rate_limit(
+    request: Request,
+     creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> AuthContext:
+    client_ip = request.client.host if request.client else "unknown"
+
+    user_id = username = jti = None
+    exp = None
+    is_auth = False
+
+    if creds is not None and creds.scheme.lower() == "bearer":
+        try:
+            claims = decode_token(creds.credentials)
+            user_id = int(claims["sub"])
+            username = claims.get("username")
+            jti = claims.get("jti")
+            exp = int(claims.get("exp", 0))
+            is_auth = True
+        except pyjwt.PyJWTError:
+            # Invalid / expired token → treated as guest.
+            # Sprint 3 will rate-limit this fallback path aggressively.
+            is_auth = False
+
+    # Revocation check — the whole point of using Redis with JWT.
+    if is_auth and jti:
+        if await get_redis().exists(f"jwt:blocklist:{jti}"):
+            raise HTTPException(status_code=401, detail="token revoked")
+
+    return AuthContext(
+        is_authenticated=is_auth,
+        user_id=user_id,
+        username=username,
+        jti=jti,
+        exp=exp,
+        client_ip=client_ip,
+    )
+
+
+def require_auth(ctx: AuthContext) -> AuthContext:
+    if not ctx.is_authenticated:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return ctx
+```
+
+================================================================================
 📄 **api\app\main.py**
-Size: 651 B | Lines: 28
+Size: 734 B | Lines: 30
 ================================================================================
 
 ```python
@@ -123,10 +241,12 @@ from .config import settings
 from .db import pools
 from .redis_client import init_redis, close_redis
 from .routers import auth, items, me
-
+from .telemetry import setup_telemetry
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # add telemetry
+    setup_telemetry() 
     await pools.init(settings.pg_primary_dsn)
     await init_redis()
     yield
@@ -146,6 +266,35 @@ async def health():
 ```
 
 ================================================================================
+📄 **api\app\redis_client.py**
+Size: 472 B | Lines: 21
+================================================================================
+
+```python
+import redis.asyncio as aioredis
+
+from .config import settings
+
+_redis: aioredis.Redis | None = None
+
+
+async def init_redis() -> None:
+    global _redis
+    _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    await _redis.ping()
+
+
+async def close_redis() -> None:
+    if _redis is not None:
+        await _redis.aclose()
+
+
+def get_redis() -> aioredis.Redis:
+    assert _redis is not None, "redis not initialised"
+    return _redis
+```
+
+================================================================================
 📄 **api\app\routers\__init__.py**
 Size: 0 B | Lines: 1
 ================================================================================
@@ -155,8 +304,55 @@ Size: 0 B | Lines: 1
 ```
 
 ================================================================================
+📄 **api\app\routers\auth.py**
+Size: 1.41 KB | Lines: 39
+================================================================================
+
+```python
+import time
+
+import bcrypt
+from fastapi import APIRouter, Depends, HTTPException
+
+from ..config import settings
+from ..db import pools
+from ..deps import AuthContext, auth_and_rate_limit, require_auth
+from ..redis_client import get_redis
+from ..schemas import LoginIn, LoginOut
+from ..security import create_token
+from ..deps import auth_and_rate_limit
+
+router = APIRouter(prefix="/auth", tags=["auth"],dependencies=[Depends(auth_and_rate_limit)])
+
+
+@router.post("/login", response_model=LoginOut)
+async def login(body: LoginIn):
+    async with pools.primary.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT id, username, password_hash FROM users WHERE username = $1",
+            body.username,
+        )
+    if not user or not bcrypt.checkpw(
+        body.password.encode("utf-8"),
+        user["password_hash"].encode("utf-8"),
+    ):
+        raise HTTPException(status_code=401, detail="invalid credentials")
+
+    token, _jti, _exp = create_token(user["id"], user["username"])
+    return LoginOut(access_token=token, expires_in=settings.jwt_ttl_seconds)
+
+
+@router.post("/logout")
+async def logout(ctx: AuthContext = Depends(auth_and_rate_limit)):
+    ctx = require_auth(ctx)
+    remaining = max(1, int((ctx.exp or 0) - time.time()))
+    await get_redis().set(f"jwt:blocklist:{ctx.jti}", "1", ex=remaining)
+    return {"ok": True, "revoked_jti": ctx.jti, "ttl": remaining}
+```
+
+================================================================================
 📄 **api\app\routers\items.py**
-Size: 3.11 KB | Lines: 88
+Size: 6.76 KB | Lines: 218
 ================================================================================
 
 ```python
@@ -165,7 +361,44 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ..db import pools
 from ..deps import AuthContext, auth_and_rate_limit, require_auth
 from ..schemas import ItemCreate, ItemUpdate
-from ..deps import auth_and_rate_limit
+
+import logging
+from opentelemetry import metrics
+
+logger = logging.getLogger("fastapi-crud-ha")
+meter = metrics.get_meter_provider().get_meter(__name__)
+
+# ---- Custom counters ----
+item_create_counter = meter.create_counter(
+    "items.created",
+    description="Number of items created",
+    unit="1",
+)
+item_update_counter = meter.create_counter(
+    "items.updated",
+    description="Number of items updated",
+    unit="1",
+)
+item_delete_counter = meter.create_counter(
+    "items.deleted",
+    description="Number of items deleted",
+    unit="1",
+)
+item_list_counter = meter.create_counter(
+    "items.listed",
+    description="Number of item list requests",
+    unit="1",
+)
+item_get_counter = meter.create_counter(
+    "items.fetched",
+    description="Number of single item fetches",
+    unit="1",
+)
+item_not_found_counter = meter.create_counter(
+    "items.not_found",
+    description="Number of item lookups that returned 404",
+    unit="1",
+)
 
 # inject auth-rate-limiting dependency
 router = APIRouter(tags=["items"], dependencies=[Depends(auth_and_rate_limit)])
@@ -183,6 +416,25 @@ async def list_items(
                FROM items ORDER BY id DESC LIMIT $1 OFFSET $2""",
             limit, offset,
         )
+
+    item_list_counter.add(
+        1,
+        {
+            "user_id": str(ctx.user_id) if ctx.user_id else "anonymous",
+            "is_authenticated": str(ctx.is_authenticated),
+            "result_count": str(len(rows)),
+        },
+    )
+    logger.info(
+        "Items listed",
+        extra={
+            "user_id": ctx.user_id,
+            "is_authenticated": ctx.is_authenticated,
+            "limit": limit,
+            "offset": offset,
+            "result_count": len(rows),
+        },
+    )
     return [dict(r) for r in rows]
 
 
@@ -195,7 +447,25 @@ async def get_item(item_id: int, ctx: AuthContext = Depends(auth_and_rate_limit)
             item_id,
         )
     if not row:
+        item_not_found_counter.add(1, {"item_id": str(item_id)})
+        logger.warning(
+            "Item not found",
+            extra={"item_id": item_id, "user_id": ctx.user_id},
+        )
         raise HTTPException(status_code=404, detail="item not found")
+
+    item_get_counter.add(
+        1,
+        {
+            "item_id": str(item_id),
+            "owner_id": str(row["owner_id"]),
+            "user_id": str(ctx.user_id) if ctx.user_id else "anonymous",
+        },
+    )
+    logger.info(
+        "Item fetched",
+        extra={"item_id": item_id, "owner_id": row["owner_id"], "user_id": ctx.user_id},
+    )
     return dict(row)
 
 
@@ -212,6 +482,20 @@ async def create_item(
                RETURNING id, owner_id, name, description, created_at, updated_at""",
             ctx.user_id, body.name, body.description,
         )
+
+    # Emit a custom metric
+    item_create_counter.add(
+        1,
+        {
+            "user_id": str(ctx.user_id),
+            "has_description": str(body.description is not None),
+        },
+    )
+    # Structured log with custom dimensions
+    logger.info(
+        "Item created",
+        extra={"item_id": row["id"], "owner_id": ctx.user_id, "name": body.name},
+    )
     return dict(row)
 
 
@@ -233,7 +517,33 @@ async def update_item(
             body.name, body.description, item_id, ctx.user_id,
         )
     if not row:
+        item_not_found_counter.add(
+            1, {"item_id": str(item_id), "op": "patch"}
+        )
+        logger.warning(
+            "Item update failed (not found or not owned)",
+            extra={"item_id": item_id, "user_id": ctx.user_id},
+        )
         raise HTTPException(status_code=404, detail="item not found or not owned by user")
+
+    item_update_counter.add(
+        1,
+        {
+            "item_id": str(item_id),
+            "user_id": str(ctx.user_id),
+            "name_changed": str(body.name is not None),
+            "description_changed": str(body.description is not None),
+        },
+    )
+    logger.info(
+        "Item updated",
+        extra={
+            "item_id": item_id,
+            "owner_id": ctx.user_id,
+            "name_changed": body.name is not None,
+            "description_changed": body.description is not None,
+        },
+    )
     return dict(row)
 
 
@@ -246,8 +556,59 @@ async def delete_item(item_id: int, ctx: AuthContext = Depends(auth_and_rate_lim
             item_id, ctx.user_id,
         )
     if res.endswith(" 0"):
+        item_not_found_counter.add(
+            1, {"item_id": str(item_id), "op": "delete"}
+        )
+        logger.warning(
+            "Item delete failed (not found or not owned)",
+            extra={"item_id": item_id, "user_id": ctx.user_id},
+        )
         raise HTTPException(status_code=404, detail="item not found or not owned by user")
+
+    item_delete_counter.add(
+        1,
+        {"item_id": str(item_id), "user_id": str(ctx.user_id)},
+    )
+    logger.info(
+        "Item deleted",
+        extra={"item_id": item_id, "owner_id": ctx.user_id},
+    )
     return None
+```
+
+================================================================================
+📄 **api\app\routers\me.py**
+Size: 902 B | Lines: 27
+================================================================================
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+
+from ..db import pools
+from ..deps import AuthContext, auth_and_rate_limit, require_auth
+from ..deps import auth_and_rate_limit
+
+# inject auth-rate-limiting dependency
+router = APIRouter(tags=["me"], dependencies=[Depends(auth_and_rate_limit)])
+
+
+
+@router.get("/me")
+async def me(ctx: AuthContext = Depends(auth_and_rate_limit)):
+    ctx = require_auth(ctx)
+    async with pools.primary.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, username, created_at FROM users WHERE id = $1",
+            ctx.user_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="user not found")
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM items WHERE owner_id = $1", ctx.user_id
+        )
+    d = dict(row)
+    d["item_count"] = count
+    return d
 ```
 
 ================================================================================
@@ -280,6 +641,40 @@ class ItemUpdate(BaseModel):
 ```
 
 ================================================================================
+📄 **api\app\security.py**
+Size: 794 B | Lines: 26
+================================================================================
+
+```python
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import jwt
+
+from .config import settings
+
+
+def create_token(user_id: int, username: str) -> tuple[str, str, int]:
+    """Returns (token, jti, exp_epoch)."""
+    jti = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    exp = int((now + timedelta(seconds=settings.jwt_ttl_seconds)).timestamp())
+    payload = {
+        "sub": str(user_id),
+        "username": username,
+        "jti": jti,
+        "iat": int(now.timestamp()),
+        "exp": exp,
+    }
+    token = jwt.encode(payload, settings.jwt_secret.get_secret_value(), algorithm=settings.jwt_alg)
+    return token, jti, exp
+
+
+def decode_token(token: str) -> dict:
+    return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_alg])
+```
+
+================================================================================
 📄 **api\Dockerfile**
 Size: 257 B | Lines: 8
 ================================================================================
@@ -297,7 +692,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 ================================================================================
 📄 **api\requirements.txt**
-Size: 146 B | Lines: 8
+Size: 182 B | Lines: 9
 ================================================================================
 
 ```
@@ -309,11 +704,12 @@ asyncpg==0.30.0
 redis==5.2.0
 PyJWT==2.9.0
 bcrypt==4.2.0
+azure-monitor-opentelemetry==1.8.2
 ```
 
 ================================================================================
 📄 **docker-compose.yml**
-Size: 1.09 KB | Lines: 42
+Size: 1.16 KB | Lines: 44
 ================================================================================
 
 ```yaml
@@ -323,15 +719,15 @@ services:
   pg-primary:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: user123
-      POSTGRES_PASSWORD: app_pwd123
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWD}
       POSTGRES_DB: appdb
     ports: ["5432:5432"]
     volumes:
       - ./postgres/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
       - pg_primary_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d appdb -h 127.0.0.1"]
+      test: ["CMD-SHELL", "pg_isready -U user123 -d appdb -h 127.0.0.1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -349,10 +745,12 @@ services:
     build: ./api
     ports: ["8000:8000"]
     environment:
-      PG_PRIMARY_DSN: postgresql://user123:app_pwd123@pg-primary:5432/appdb
+      PG_PRIMARY_DSN: ${PG_PRIMARY_DSN}
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: "K2yBfQFgPnFvCBecUHHqb4h8geNPs3aqsvs4N1A9ouA"
+      JWT_SECRET: ${JWT_SECRET}
       JWT_TTL_SECONDS: "3600"
+      APPLICATIONINSIGHTS_CONNECTION_STRING: ${APPLICATIONINSIGHTS_CONNECTION_STRING}
+      APPLICATIONINSIGHTS_ENABLED: "true"
     depends_on:
       pg-primary: { condition: service_healthy }
       redis:      { condition: service_healthy }
@@ -392,6 +790,105 @@ INSERT INTO users (username, password_hash) VALUES
 ON CONFLICT (username) DO NOTHING;
 ```
 
+================================================================================
+📄 **README.md**
+Size: 2.85 KB | Lines: 91
+================================================================================
+
+```markdown
+
+## Sprint-1
+
+**Start the Instance**
+
+```bash
+# delete volume & any broken pg_primary data
+docker compose down -v
+# start instance
+docker compose up --build -d 
+# check logs - in pgadmin4 
+docker compose logs -f pg-primary
+# test on docker (pg-primary: The specific service/container name defined in your docker-compose.yml)
+docker compose exec pg-primary psql -U app -d appdb -c "SELECT id, username FROM users;"
+# testing on postman
+localhost:8000/health
+
+```
+
+## Sprint -2
+
+```python
+import secrets
+# URL-Safe Base64 Token - put it in config.py,docker-compose.yml
+url_token = secrets.token_urlsafe(32)
+# Here it's - Bearer K2yBfQFgPnFvCBecUHHqb4h8geNPs3aqsvs4N1A9ouA
+```
+
+iat, jti, exp, and sub are standard registered claims used in the payload of a JSON Web Token (JWT) to convey specific metadata about the token and the user
+
+    • iat (Issued At): Records the Unix timestamp of when the token was created, helping systems calculate the token's age.
+    • jti (JWT ID): Provides a unique string identifier for the token, typically used to prevent replay attacks or handle token revocation.
+    • exp (Expiration Time): Sets the Unix timestamp after which the token becomes invalid and must be rejected.
+    • sub (Subject): Identifies the principal entity the token is about, usually representing the unique user ID
+
+```bash
+# remove previous volume (if getting error)
+docker compose down 
+docker compose up --build -d
+docker compose logs -f api 
+
+# re-building particular part
+docker compose up -d --build api
+
+# get registered users (seed.sql)
+docker compose exec pg-primary psql -U user123 -d appdb -c "SELECT id, username, left(password_hash,7) AS hash_prefix FROM users;"
+
+# First use the Bearer token & get the JWT token per user (alice,bob) 
+# - then login using JWT , when loged in for a particular user
+# you have view access to other user but can't PATCH,DELETE entry
+# created by other user
+```
+
+
+
+```bash
+.
+├── docker-compose.yml
+├── README.md
+├── postgres/
+│   └── seed.sql
+├── api/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app/
+│       ├── __init__.py
+│       ├── config.py
+│       ├── security.py
+│       ├── redis_client.py
+│       ├── ratelimit.lua
+│       ├── rabbit.py
+│       ├── deps.py
+│       ├── schemas.py
+│       ├── main.py
+│       └── routers/
+│           ├── __init__.py
+│           ├── auth.py
+│           ├── items.py
+│           └── me.py
+└── worker/
+    ├── Dockerfile
+    ├── requirements.txt
+    └── worker/
+        ├── __init__.py
+        ├── config.py
+        ├── db.py
+        ├── breaker.py
+        ├── handlers.py
+        └── main.py
+
+```
+```
+
 ---
 *Generated by Codebase Prompt Packer for VS Code*
-*Total files processed: 12 | Generated on: 10/7/2026, 9:14:43 AM*
+*Total files processed: 18 | Generated on: 10/14/2026, 12:03:40 AM*

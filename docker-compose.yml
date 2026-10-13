@@ -4,15 +4,15 @@ services:
   pg-primary:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: user123
-      POSTGRES_PASSWORD: app_pwd123
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWD}
       POSTGRES_DB: appdb
     ports: ["5432:5432"]
     volumes:
       - ./postgres/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
       - pg_primary_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d appdb -h 127.0.0.1"]
+      test: ["CMD-SHELL", "pg_isready -U user123 -d appdb -h 127.0.0.1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -30,10 +30,12 @@ services:
     build: ./api
     ports: ["8000:8000"]
     environment:
-      PG_PRIMARY_DSN: postgresql://user123:app_pwd123@pg-primary:5432/appdb
+      PG_PRIMARY_DSN: ${PG_PRIMARY_DSN}
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: "K2yBfQFgPnFvCBecUHHqb4h8geNPs3aqsvs4N1A9ouA"
+      JWT_SECRET: ${JWT_SECRET}
       JWT_TTL_SECONDS: "3600"
+      APPLICATIONINSIGHTS_CONNECTION_STRING: ${APPLICATIONINSIGHTS_CONNECTION_STRING}
+      APPLICATIONINSIGHTS_ENABLED: "true"
     depends_on:
       pg-primary: { condition: service_healthy }
       redis:      { condition: service_healthy }

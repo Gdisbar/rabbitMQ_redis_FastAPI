@@ -18,9 +18,13 @@ def create_token(user_id: int, username: str) -> tuple[str, str, int]:
         "iat": int(now.timestamp()),
         "exp": exp,
     }
-    token = jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_alg)
+    token = jwt.encode(payload, settings.jwt_secret.get_secret_value(), algorithm=settings.jwt_alg)
     return token, jti, exp
 
 
 def decode_token(token: str) -> dict:
-    return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_alg])
+    return jwt.decode(
+        token,
+        settings.jwt_secret.get_secret_value(),   # unwrap SecretStr
+        algorithms=[settings.jwt_alg],
+    )
