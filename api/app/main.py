@@ -19,7 +19,7 @@ from .routers import auth, items, me
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     
-    await pools.init(settings.pg_primary_dsn)
+    await pools.init(settings.pg_primary_dsn.get_secret_value())
     await init_redis()
     yield
     await close_redis()

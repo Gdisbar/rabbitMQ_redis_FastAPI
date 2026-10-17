@@ -9,7 +9,6 @@ from ..deps import AuthContext, auth_and_rate_limit, require_auth
 from ..redis_client import get_redis
 from ..schemas import LoginIn, LoginOut
 from ..security import create_token
-from ..deps import auth_and_rate_limit
 
 router = APIRouter(prefix="/auth", tags=["auth"],dependencies=[Depends(auth_and_rate_limit)])
 

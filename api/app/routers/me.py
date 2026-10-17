@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ..db import pools
 from ..deps import AuthContext, auth_and_rate_limit, require_auth
-from ..deps import auth_and_rate_limit
+
 
 # inject auth-rate-limiting dependency
 router = APIRouter(tags=["me"], dependencies=[Depends(auth_and_rate_limit)])

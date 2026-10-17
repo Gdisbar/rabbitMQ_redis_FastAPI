@@ -7,7 +7,7 @@ from ..schemas import ItemCreate, ItemUpdate
 import logging
 from opentelemetry import metrics
 
-logger = logging.getLogger("fastapi-crud-ha")
+logger = logging.getLogger("fastapi-crud")
 meter = metrics.get_meter_provider().get_meter(__name__)
 
 # ---- Custom counters ----
@@ -136,8 +136,9 @@ async def create_item(
     # Structured log with custom dimensions
     logger.info(
         "Item created",
-        extra={"item_id": row["id"], "owner_id": ctx.user_id, "name": body.name},
+        extra={"item_id": row["id"], "owner_id": ctx.user_id, "item_name": body.name},
     )
+    
     return dict(row)
 
 

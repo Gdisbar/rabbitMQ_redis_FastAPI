@@ -1,10 +1,9 @@
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     # ---- Database ----
-    # No default → app will fail fast if not provided in production.
     pg_primary_dsn: SecretStr = Field(..., description="Postgres DSN")
 
     # ---- Redis ----
@@ -34,25 +33,27 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore",          # ignore unrelated env vars
+        extra="ignore",
     )
 
-    # ---- Validators ----
     @field_validator("jwt_secret")
     @classmethod
     def _jwt_secret_strength(cls, v: SecretStr) -> SecretStr:
         raw = v.get_secret_value()
-        # Reject obviously weak secrets
         if raw.lower() in {"secret", "changeme", "password", "test"}:
             raise ValueError("jwt_secret is too weak")
         return v
 
-    @field_validator("applicationinsights_connection_string")
-    @classmethod
-    def _ai_required_if_enabled(cls, v, info):
-        # If AI is enabled, the connection string must be present.
-        # (Runs after `enabled` in field order — see model_validator below if you reorder.)
-        return v
+    @model_validator(mode="after")
+    def _ai_required_if_enabled(self) -> "Settings":
+        if self.applicationinsights_enabled:
+            cs = self.applicationinsights_connection_string
+            if cs is None or not cs.get_secret_value().strip():
+                raise ValueError(
+                    "applicationinsights_connection_string must be set "
+                    "when applicationinsights_enabled is true"
+                )
+        return self
 
 
 settings = Settings()
